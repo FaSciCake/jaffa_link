@@ -1,0 +1,25 @@
+# Secrets — never commit the real bot token
+converter_config.py
+
+# Virtual environments
+.venv-dev/
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+
+# Runtime data — transfer artifacts, not source
+received/
+archived/
+temp_videos/
+
+# OS cruft
+Thumbs.db
+.DS_Store
