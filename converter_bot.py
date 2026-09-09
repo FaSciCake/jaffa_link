@@ -33,6 +33,7 @@ import logging
 import os
 import re
 import shutil
+import time
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -70,6 +71,15 @@ for d in (RECEIVED_DIR, ARCHIVE_DIR, TEMP_DIR):
 
 CHUNK_RE = re.compile(r'^(\d+)/(\d+):(.+)$')
 HASH_RE  = re.compile(r'^HASH:([0-9a-f]{64})$')
+
+# Minimum real time between progress-bar edits. Telegram's editMessageText
+# has an unofficial ~1/sec flood limit per chat; scanning a pre-recorded
+# video isn't real-time-bound (cv2 decodes frames as fast as the CPU
+# allows), so gating purely on chunk count (the old "every 5 chunks" rule)
+# could fire edits many times a second on a fast decode and get flood-
+# limited. Gating on wall-clock time instead stays responsive without
+# tripping that limit, regardless of how fast any given video decodes.
+PROGRESS_EDIT_INTERVAL = 1.2  # seconds
 
 is_busy = False  # True while the worker is actively processing a job (distinct from queue backlog)
 
@@ -250,9 +260,10 @@ def scan_video_sync(video_path: Path, status: StatusMessage, loop: asyncio.Abstr
     # QR code per slide — zxing-cpp returns all of them per frame, and we
     # want to skip re-processing any of them while that same slide is still
     # on screen, not just the last one we happened to handle.
-    last_texts  = set()
-    frame_idx   = 0
-    last_notify = -1  # last chunk count we sent a status update for
+    last_texts   = set()
+    frame_idx    = 0
+    last_notify  = -1   # last chunk count we sent a status update for
+    last_edit_at = 0.0  # time.monotonic() of the last progress-bar edit
 
     while True:
         ret, frame = cap.read()
@@ -285,9 +296,12 @@ def scan_video_sync(video_path: Path, status: StatusMessage, loop: asyncio.Abstr
                 if idx not in chunks:
                     chunks[idx] = payload
 
-                # Send a status update every 5 new chunks (rate-limit edits)
-                if len(chunks) % 5 == 0 and len(chunks) != last_notify:
-                    last_notify = len(chunks)
+                # Rate-limit progress-bar edits by wall-clock time, not chunk
+                # count -- see PROGRESS_EDIT_INTERVAL above.
+                now = time.monotonic()
+                if len(chunks) != last_notify and now - last_edit_at >= PROGRESS_EDIT_INTERVAL:
+                    last_notify  = len(chunks)
+                    last_edit_at = now
                     pct  = int(len(chunks) / total_exp * 100)
                     fill = int(pct / 5)
                     bar  = "▓" * fill + "░" * (20 - fill)
