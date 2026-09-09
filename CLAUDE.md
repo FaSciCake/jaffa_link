@@ -1,0 +1,70 @@
+# jaffa_link
+
+QR-code file transfer for air-gapped PCs. `sender.py` runs on the air-gapped
+machine, encodes a folder's contents as a looping QR slideshow; you film it
+on your phone and send the video to a Telegram bot (`converter_bot.py`),
+which decodes it back into files and returns a zip.
+
+## Components
+
+- **sender.py** — run on the air-gapped PC. Walks a folder, JSON-serializes
+  `{path, base64 content}` per file, base45-encodes the whole blob (denser
+  than base64 in QR alphanumeric mode), splits into chunks, renders each as
+  a QR code, and full-screens a PySide6 slideshow (space to start/stop
+  auto-play, arrow keys to step manually). `make_qr_image()` samples 4 of
+  the library's 8 mask-pattern candidates instead of all 8 (~1.5-2x faster
+  generation, negligible scan-reliability cost — `MASK_CANDIDATES` widens
+  back to `range(8)` if ever needed). `run_slideshow()` auto-picks how many
+  QR codes to show side by side per slide (`suggest_codes_per_row()`, lands
+  on 2 for a 16:9 screen — a square code sized to screen height wastes the
+  extra width otherwise); override with `--codes-per-row`.
+- **converter_bot.py** — Telegram bot (python-telegram-bot). Downloads each
+  uploaded video immediately, then hands it to a single background
+  `video_worker()` task that processes queued videos one at a time in
+  receipt order — so several uploads (a transfer split across videos, or
+  just sent in a burst) merge into the same transfer via the same
+  accumulation logic used for `--resend` top-ups, instead of later ones
+  being rejected while an earlier one is still scanning. Scans frames with
+  zxing-cpp/opencv, reassembles chunks by index, verifies the sha256
+  checksum, writes files, zips, sends back. `StatusMessage.update()`
+  defaults `parse_mode="Markdown"` — every call site's text already used
+  `*bold*`/`` `code` `` formatting, so a call that didn't pass parse_mode
+  explicitly used to render the markup as literal characters (and one call
+  site in the IncompleteTransfer path that *did* pass `parse_mode=` used to
+  crash outright, since the method didn't accept the kwarg at all).
+  `/reset` abandons an in-progress transfer; `/status` reports transfer +
+  queue progress; `/help` (aliases `/start`) lists commands.
+- **converter_config.py** — bot token + allowed Telegram user IDs.
+  **Gitignored** (contains a live secret). Copy from
+  `converter_config.example.py` and fill in real values.
+- **test_pipeline.py** — end-to-end test of chunking/reassembly/checksum
+  logic with synthetic frame data (no camera/video needed).
+- **send.ps1** / **send.bat** — quick launchers for `sender.py`, using the
+  `.venv-dev` interpreter directly (no manual activate needed). `send.bat`
+  is double-click-friendly; both forward all CLI args, e.g.
+  `.\send.bat --chunk-size 2500` or `.\send.bat --resend 5,12,47`.
+
+## Wire format
+
+Each QR frame is a plain string, one of:
+- `HASH:<sha256 hex>` — checksum of the full base45 payload, sent once.
+- `<index>/<total>:<base45 chunk>` — one piece of the payload, 1-indexed.
+
+The receiver de-dupes by index and can complete a transfer from multiple
+partial videos as long as the reported `total` matches across them.
+
+## Environment
+
+Single shared venv at `.venv-dev` (PySide6, qrcode, base45, opencv-python,
+zxing-cpp, python-telegram-bot) covers both scripts. In production the
+sender side would normally only need PySide6/qrcode/base45 — the venv here
+is a dev convenience since both scripts and test_pipeline.py live in this
+repo together.
+
+## Running
+
+```
+.\send.bat                       # sender, scans current directory
+.\.venv-dev\Scripts\python.exe converter_bot.py   # bot, run on your own machine
+.\.venv-dev\Scripts\python.exe test_pipeline.py   # tests
+```

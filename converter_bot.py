@@ -8,6 +8,16 @@ If a video is missing some chunks, progress is kept: send another
 merge with what's already been collected instead of starting over.
 Send /reset to abandon an in-progress transfer and start fresh.
 
+Videos are queued, not rejected: send several in a row (or while one is
+still processing) and they're handled one at a time, in order, each
+merging its chunks into the same transfer via the same accumulation
+logic used for --resend top-ups. /status reports queue + progress.
+
+Works the same whether the sender shows one QR code at a time or several
+side by side on the same slide — zxing-cpp already detects and decodes
+every barcode it finds in a frame, so this file doesn't need to know how
+many codes are on screen at once.
+
 Requirements:
     pip install python-telegram-bot opencv-python zxing-cpp base45
 
@@ -24,6 +34,7 @@ import os
 import re
 import shutil
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -60,7 +71,29 @@ for d in (RECEIVED_DIR, ARCHIVE_DIR, TEMP_DIR):
 CHUNK_RE = re.compile(r'^(\d+)/(\d+):(.+)$')
 HASH_RE  = re.compile(r'^HASH:([0-9a-f]{64})$')
 
-is_busy = False
+is_busy = False  # True while the worker is actively processing a job (distinct from queue backlog)
+
+# Videos are downloaded as soon as they arrive but *processed* one at a
+# time by video_worker(), in receipt order. This is what lets multiple
+# uploads (a transfer split across videos, or just sent back-to-back)
+# merge into one transfer automatically instead of the later ones being
+# rejected while the first is still scanning.
+pending_videos: asyncio.Queue["VideoJob"] = asyncio.Queue()
+
+
+@dataclass
+class VideoJob:
+    video_path: Path
+    fname:      str
+    status:     "StatusMessage"
+    chat_id:    int
+
+
+def escape_backticks(text: str) -> str:
+    """Defang literal backticks in untrusted text (e.g. a phone's filename)
+    so it can't break out of a Markdown code span and crash the send."""
+    return text.replace('`', "'")
+
 
 # Progress persists across multiple video uploads so a short "topped up"
 # video (sender.py --resend ...) can complete a transfer that an earlier
@@ -103,12 +136,18 @@ class StatusMessage:
         self._text   = message.text or ""
         self._last   = self._text
 
-    async def update(self, text: str, force: bool = False):
-        """Edit the message only if text actually changed (avoids flood limits)."""
+    async def update(self, text: str, force: bool = False, parse_mode: str | None = "Markdown"):
+        """Edit the message only if text actually changed (avoids flood limits).
+
+        Defaults to Markdown parsing since every call site formats its text
+        with *bold* / `code` markup — without passing parse_mode through,
+        Telegram was rendering it as literal asterisks and backticks instead
+        of actually applying it.
+        """
         if text == self._last and not force:
             return
         try:
-            self._msg = await self._msg.edit_text(text)
+            self._msg = await self._msg.edit_text(text, parse_mode=parse_mode)
             self._last = text
         except TelegramError:
             pass  # silently ignore edit failures (e.g. message too old)
@@ -206,7 +245,12 @@ def scan_video_sync(video_path: Path, status: StatusMessage, loop: asyncio.Abstr
     chunks      = {}
     total_exp   = None
     found_hash  = None
-    last_text   = None
+    # Texts already handled as of the most recently *checked* frame. A set
+    # rather than a single value because the sender may show more than one
+    # QR code per slide — zxing-cpp returns all of them per frame, and we
+    # want to skip re-processing any of them while that same slide is still
+    # on screen, not just the last one we happened to handle.
+    last_texts  = set()
     frame_idx   = 0
     last_notify = -1  # last chunk count we sent a status update for
 
@@ -217,13 +261,14 @@ def scan_video_sync(video_path: Path, status: StatusMessage, loop: asyncio.Abstr
 
         if frame_idx % STEP == 0:
             results = zxingcpp.read_barcodes(frame)
+            current_texts = set()
             for r in results:
                 if not r.valid:
                     continue
                 text = r.text.strip()
-                if text == last_text:
+                current_texts.add(text)
+                if text in last_texts:
                     continue
-                last_text = text
 
                 hm = HASH_RE.match(text)
                 if hm:
@@ -251,6 +296,8 @@ def scan_video_sync(video_path: Path, status: StatusMessage, loop: asyncio.Abstr
                         f"`[{bar}]` {len(chunks)}/{total_exp} chunks ({pct}%)"
                     )
                     asyncio.run_coroutine_threadsafe(status.update(txt), loop)
+
+            last_texts = current_texts
 
         frame_idx += 1
         # Only stop early once we have every chunk *and* the checksum frame
@@ -308,15 +355,39 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Not authorized.")
         return
     await update.message.reply_text(
-        "👋 *QR Converter Bot* is ready\\!\n\n"
-        "Send me a video file \\(`.mov` or `.mp4`\\) recorded from the QR slideshow\\.\n"
-        "I'll decode it and send back a zip with all the files\\.\n\n"
+        "👋 *QR Converter Bot* is ready!\n\n"
+        "Send me a video file (`.mov` or `.mp4`) recorded from the QR slideshow. "
+        "I'll decode it and send back a zip with all the files.\n\n"
+        "Send several videos back-to-back (or while one's still processing) "
+        "and I'll queue them, working through them in order and merging "
+        "chunks into the same transfer automatically.\n\n"
         "If a video is missing some chunks, I'll keep what I've got — just "
-        "send a top\\-up video and it'll merge in\\. Use /reset to abandon "
-        "an in\\-progress transfer\\.\n\n"
-        "One job at a time — send the video whenever you're ready\\!",
-        parse_mode="MarkdownV2",
+        "send a top-up video and it'll merge in.\n\n"
+        "/status — check transfer + queue progress\n"
+        "/reset — abandon the in-progress transfer\n"
+        "/help — show this again",
+        parse_mode="Markdown",
     )
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    lines = []
+    if accumulated_total is not None:
+        lines.append(f"📦 Transfer in progress: {len(accumulated_chunks)}/{accumulated_total} chunks collected.")
+    else:
+        lines.append("No transfer in progress.")
+
+    if is_busy:
+        lines.append("🎬 Currently processing a video.")
+    qsize = pending_videos.qsize()
+    if qsize:
+        lines.append(f"⏳ {qsize} video(s) queued behind it.")
+    elif not is_busy:
+        lines.append("Queue is empty.")
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -331,8 +402,6 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global is_busy
-
     user_id = update.effective_user.id
     if not is_allowed(user_id):
         return
@@ -345,75 +414,103 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Check extension loosely
-    fname = doc.file_name or ""
+    fname = doc.file_name or f"video_{msg.message_id}.mp4"
     if not any(fname.lower().endswith(ext) for ext in (".mov", ".mp4", ".avi", ".mkv")):
-        await msg.reply_text(f"Unexpected file type: `{fname}`\nExpected a .mov or .mp4 video.", parse_mode="Markdown")
+        await msg.reply_text(f"Unexpected file type: `{escape_backticks(fname)}`\nExpected a .mov or .mp4 video.", parse_mode="Markdown")
         return
-
-    # Overlap guard
-    if is_busy:
-        await msg.reply_text("⏳ Already processing a video. Please wait until it's done!")
-        return
-    is_busy = True
 
     # Post an initial status message we'll edit throughout
-    status_msg = await msg.reply_text("⬇️ *Downloading video…*", parse_mode="Markdown")
+    status_msg = await msg.reply_text(f"⬇️ Downloading `{escape_backticks(fname)}`…", parse_mode="Markdown")
     status     = StatusMessage(status_msg)
-    video_path = TEMP_DIR / fname
+    # message_id keeps two queued uploads that happen to share a filename
+    # from colliding on disk before the worker gets to either of them.
+    video_path = TEMP_DIR / f"{msg.message_id}_{fname}"
 
     try:
-        # Download
         await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
         tg_file = await doc.get_file()
         await tg_file.download_to_drive(str(video_path))
         size_mb = video_path.stat().st_size / 1_048_576
-        await status.update(f"✅ Downloaded `{fname}` ({size_mb:.1f} MB)\n\n🎬 *Step 1/4* — Scanning video frames…")
+    except Exception as e:
+        logger.exception("Download failed")
+        await status.update(f"❌ Download failed: {e}")
+        return
 
-        # Process
-        zip_path, file_count = await process_video(video_path, status)
-
-        # Send result
-        await status.update(f"📤 Sending zip ({file_count} file(s))…")
-        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-        with open(zip_path, "rb") as f:
-            await msg.reply_document(
-                document=f,
-                filename=zip_path.name,
-                caption=f"✅ Done! {file_count} file(s) packed into `{zip_path.name}`",
-                parse_mode="Markdown",
-            )
-        await status.update(f"✅ All done! Sent `{zip_path.name}` with {file_count} file(s).")
-
-    except IncompleteTransfer as e:
-        shown = e.missing[:20]
-        more  = f" (+{len(e.missing) - 20} more)" if len(e.missing) > 20 else ""
-        missing_str = ",".join(str(i) for i in e.missing)
+    # Queue for processing — video_worker() handles jobs one at a time, in
+    # order, so several uploads (a transfer split across videos, or just
+    # sent in a burst) merge into the same transfer instead of the later
+    # ones being rejected while an earlier one is still scanning.
+    ahead = pending_videos.qsize() + (1 if is_busy else 0)
+    if ahead == 0:
+        await status.update(f"✅ Downloaded `{escape_backticks(fname)}` ({size_mb:.1f} MB)\n\n🎬 *Step 1/4* — Scanning video frames…")
+    else:
+        plural = "s" if ahead != 1 else ""
         await status.update(
-            f"📦 Got {e.found}/{e.total} chunks so far — progress saved.\n"
-            f"Still missing {len(e.missing)}: {shown}{more}\n\n"
-            f"On the sender PC, run:\n"
-            f"`python sender.py --resend {missing_str}`\n"
-            f"and send me that (shorter) video — no need to redo the whole thing.\n\n"
-            f"Or send /reset to abandon this transfer and start over.",
-            parse_mode="Markdown",
+            f"✅ Downloaded `{escape_backticks(fname)}` ({size_mb:.1f} MB)\n"
+            f"⏳ Queued behind {ahead} video{plural} — I'll start automatically once free."
         )
 
-    except Exception as e:
-        logger.exception("Processing failed")
-        await status.update(f"❌ Error: {e}")
+    await pending_videos.put(VideoJob(video_path=video_path, fname=fname, status=status, chat_id=msg.chat_id))
 
-    finally:
-        is_busy = False
-        # Clean up temp video
-        if video_path.exists():
-            video_path.unlink()
+
+async def video_worker(bot):
+    """Pulls queued videos one at a time and runs the full pipeline on each,
+    so uploads never race each other over the shared accumulated_* state."""
+    global is_busy
+    while True:
+        job = await pending_videos.get()
+        is_busy = True
+        try:
+            zip_path, file_count = await process_video(job.video_path, job.status)
+
+            await job.status.update(f"📤 Sending zip ({file_count} file(s))…")
+            await bot.send_chat_action(chat_id=job.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+            with open(zip_path, "rb") as f:
+                await bot.send_document(
+                    chat_id=job.chat_id,
+                    document=f,
+                    filename=zip_path.name,
+                    caption=f"✅ Done! {file_count} file(s) packed into `{zip_path.name}`",
+                    parse_mode="Markdown",
+                )
+            await job.status.update(f"✅ All done! Sent `{zip_path.name}` with {file_count} file(s).")
+
+        except IncompleteTransfer as e:
+            shown = e.missing[:20]
+            more  = f" (+{len(e.missing) - 20} more)" if len(e.missing) > 20 else ""
+            missing_str = ",".join(str(i) for i in e.missing)
+            await job.status.update(
+                f"📦 Got {e.found}/{e.total} chunks so far — progress saved.\n"
+                f"Still missing {len(e.missing)}: {shown}{more}\n\n"
+                f"On the sender PC, run:\n"
+                f"`python sender.py --resend {missing_str}`\n"
+                f"and send me that (shorter) video — no need to redo the whole thing.\n\n"
+                f"Or send /reset to abandon this transfer and start over."
+            )
+
+        except Exception as e:
+            logger.exception("Processing failed")
+            await job.status.update(f"❌ Error: {e}")
+
+        finally:
+            is_busy = False
+            if job.video_path.exists():
+                job.video_path.unlink()
+            pending_videos.task_done()
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
+async def post_init(app: Application):
+    # Runs once, in the app's own event loop, before polling starts.
+    app.create_task(video_worker(app.bot), name="video_worker")
+
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("reset", cmd_reset))
     # Catch both document and video message types
     app.add_handler(MessageHandler(filters.Document.ALL | filters.VIDEO, handle_video))
