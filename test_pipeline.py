@@ -79,7 +79,7 @@ async def main():
     v1_chunks, v1_total, v1_hash = parse_frames_to_scan_result(video1_frames)
     assert v1_hash is None, "video 1 should not have captured the hash frame"
 
-    cb.scan_video_sync = lambda video_path, status, loop: (v1_chunks, v1_total, v1_hash)
+    cb.scan_video_sync = lambda video_path, status, loop, baseline=frozenset(): (v1_chunks, v1_total, v1_hash)
 
     status = FakeStatus()
     dummy_path = Path("/tmp/does_not_need_to_exist.mp4")
@@ -102,7 +102,7 @@ async def main():
         f for f in data_chunks if int(f.split('/', 1)[0]) in resend_wanted
     ]
     v2_chunks, v2_total, v2_hash = parse_frames_to_scan_result(resend_frames)
-    cb.scan_video_sync = lambda video_path, status, loop: (v2_chunks, v2_total, v2_hash)
+    cb.scan_video_sync = lambda video_path, status, loop, baseline=frozenset(): (v2_chunks, v2_total, v2_hash)
 
     zip_path, file_count = await cb.process_video(dummy_path, status)
     print(f"\nVideo 2 (resend) -> success. {file_count} files, zip at {zip_path}")
@@ -136,7 +136,7 @@ async def main():
     flipped = ('A' if original_payload[0] != 'A' else 'B') + original_payload[1:]
     corrupt_chunks[some_idx] = flipped
 
-    cb.scan_video_sync = lambda video_path, status, loop: (corrupt_chunks, full_total, digest)
+    cb.scan_video_sync = lambda video_path, status, loop, baseline=frozenset(): (corrupt_chunks, full_total, digest)
     try:
         await cb.process_video(dummy_path, status)
         raise SystemExit("FAIL: expected checksum ValueError on corrupted chunk, got success")

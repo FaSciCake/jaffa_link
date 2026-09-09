@@ -86,6 +86,13 @@ PROGRESS_EDIT_INTERVAL = 0.8  # seconds
 # see MAX_RESEND_LIST_CHARS usage in the IncompleteTransfer handler below.
 MAX_RESEND_LIST_CHARS = 3500
 
+# Downscale frames wider/taller than this before handing them to zxing-cpp.
+# Barcode detection cost scales with pixel count, but a QR code doesn't need
+# 1080p/4K resolution to decode reliably -- it needs each module to be a few
+# pixels wide, which 1600px on the long side comfortably covers even for two
+# codes side by side. Cuts scan time substantially on typical phone video.
+MAX_SCAN_DIM = 1600
+
 is_busy = False  # True while the worker is actively processing a job (distinct from queue backlog)
 
 # Videos are downloaded as soon as they arrive but *processed* one at a
@@ -108,6 +115,46 @@ def escape_backticks(text: str) -> str:
     """Defang literal backticks in untrusted text (e.g. a phone's filename)
     so it can't break out of a Markdown code span and crash the send."""
     return text.replace('`', "'")
+
+
+COVERAGE_WIDTH  = 30
+COVERAGE_SHADES = " ░▒▓█"  # 5 levels: 0%, ~25%, ~50%, ~75%, 100% present
+
+
+def render_coverage_bar(present: set[int], total: int, width: int = COVERAGE_WIDTH) -> str:
+    """Compact visual map of which part of the 1..total chunk range is
+    present. Each character is one equal-sized slice of the index range,
+    shaded by how much of that slice has actually been collected -- so a
+    missing tail, a missing head, or scattered gaps are all visible at a
+    glance instead of buried in a list of numbers."""
+    if total <= 0:
+        return ""
+    out = []
+    for w in range(width):
+        lo = int(w * total / width) + 1
+        hi = max(lo, int((w + 1) * total / width))
+        have = sum(1 for i in range(lo, hi + 1) if i in present)
+        frac = have / (hi - lo + 1)
+        level = round(frac * (len(COVERAGE_SHADES) - 1))
+        out.append(COVERAGE_SHADES[level])
+    return "".join(out)
+
+
+def compress_ranges(sorted_indices: list[int]) -> list[str]:
+    """[5,6,7,9,12,13] -> ['5-7', '9', '12-13'] -- turns a flat list of
+    missing chunk numbers into human-readable spans."""
+    if not sorted_indices:
+        return []
+    spans = []
+    start = prev = sorted_indices[0]
+    for i in sorted_indices[1:]:
+        if i == prev + 1:
+            prev = i
+            continue
+        spans.append(str(start) if start == prev else f"{start}-{prev}")
+        start = prev = i
+    spans.append(str(start) if start == prev else f"{start}-{prev}")
+    return spans
 
 
 # Progress persists across multiple video uploads so a short "topped up"
@@ -190,10 +237,16 @@ async def process_video(video_path: Path, status: StatusMessage) -> tuple[Path, 
     global accumulated_chunks, accumulated_total, accumulated_hash
     loop = asyncio.get_event_loop()
 
+    # Snapshot rather than handing the live dict into the executor thread --
+    # scan_video_sync only reads it (for combined-progress display), and a
+    # snapshot avoids any doubt about touching shared state cross-thread.
+    baseline = set(accumulated_chunks)
+    continuing_note = f" (continuing from {len(baseline)}/{accumulated_total})" if baseline else ""
+
     # Step 1 — Scan video frames
-    await status.update("🎬 *Step 1/4* — Scanning video frames…")
+    await status.update(f"🎬 *Step 1/4* — Scanning video frames…{continuing_note}")
     video_chunks, video_total, video_hash = await loop.run_in_executor(
-        None, scan_video_sync, video_path, status, loop
+        None, scan_video_sync, video_path, status, loop, baseline
     )
 
     if not video_chunks or video_total is None:
@@ -246,8 +299,16 @@ async def process_video(video_path: Path, status: StatusMessage) -> tuple[Path, 
     return zip_path, file_count
 
 
-def scan_video_sync(video_path: Path, status: StatusMessage, loop: asyncio.AbstractEventLoop):
-    """Blocking video scan — called in executor."""
+def scan_video_sync(video_path: Path, status: StatusMessage, loop: asyncio.AbstractEventLoop,
+                     baseline: set[int] = frozenset()):
+    """Blocking video scan — called in executor.
+
+    `baseline` is the set of chunk indices already collected from earlier
+    videos in this transfer (empty for a fresh transfer). It only affects
+    what the progress bar *displays* -- reassembly and merging still happen
+    in process_video regardless -- so a --resend video's progress reads as
+    overall transfer completion instead of restarting from 0 every time.
+    """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
@@ -276,8 +337,10 @@ def scan_video_sync(video_path: Path, status: StatusMessage, loop: asyncio.Abstr
     # on screen, not just the last one we happened to handle.
     last_texts   = set()
     frame_idx    = 0
-    last_notify  = -1   # last chunk count we sent a status update for
+    last_notify  = -1   # last combined-progress count we sent a status update for
     last_edit_at = 0.0  # time.monotonic() of the last progress-bar edit
+    scan_start   = time.monotonic()
+    new_found    = 0    # chunks this video contributed that weren't already in baseline
 
     while True:
         ret, frame = cap.read()
@@ -285,7 +348,13 @@ def scan_video_sync(video_path: Path, status: StatusMessage, loop: asyncio.Abstr
             break
 
         if frame_idx % STEP == 0:
-            results = zxingcpp.read_barcodes(frame)
+            h, w = frame.shape[:2]
+            if max(h, w) > MAX_SCAN_DIM:
+                scale = MAX_SCAN_DIM / max(h, w)
+                scan_frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+            else:
+                scan_frame = frame
+            results = zxingcpp.read_barcodes(scan_frame)
             current_texts = set()
             for r in results:
                 if not r.valid:
@@ -309,19 +378,36 @@ def scan_video_sync(video_path: Path, status: StatusMessage, loop: asyncio.Abstr
                     total_exp = total
                 if idx not in chunks:
                     chunks[idx] = payload
+                    if idx not in baseline:
+                        new_found += 1
+
+                # Combined = baseline (already collected from earlier videos
+                # in this transfer) + newly found here -- so a --resend
+                # video's bar reads as overall transfer progress, not "3/2624"
+                # every time regardless of which indices it's contributing.
+                combined = len(baseline) + new_found
 
                 # Rate-limit progress-bar edits by wall-clock time, not chunk
                 # count -- see PROGRESS_EDIT_INTERVAL above.
                 now = time.monotonic()
-                if len(chunks) != last_notify and now - last_edit_at >= PROGRESS_EDIT_INTERVAL:
-                    last_notify  = len(chunks)
+                if combined != last_notify and now - last_edit_at >= PROGRESS_EDIT_INTERVAL:
+                    last_notify  = combined
                     last_edit_at = now
-                    pct  = int(len(chunks) / total_exp * 100)
+                    pct  = int(combined / total_exp * 100)
                     fill = int(pct / 5)
                     bar  = "▓" * fill + "░" * (20 - fill)
-                    txt  = (
+
+                    extra = []
+                    if baseline:
+                        extra.append(f"+{new_found} new")
+                    elapsed = now - scan_start
+                    if elapsed >= 1.0 and new_found > 0:
+                        extra.append(f"{new_found / elapsed:.1f}/s")
+                    suffix = f" · {' · '.join(extra)}" if extra else ""
+
+                    txt = (
                         f"🎬 *Step 1/4* — Scanning video frames…\n"
-                        f"`[{bar}]` {len(chunks)}/{total_exp} chunks ({pct}%)"
+                        f"`[{bar}]` {combined}/{total_exp} chunks ({pct}%){suffix}"
                     )
                     asyncio.run_coroutine_threadsafe(status.update(txt), loop)
 
@@ -404,6 +490,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
     if accumulated_total is not None:
         lines.append(f"📦 Transfer in progress: {len(accumulated_chunks)}/{accumulated_total} chunks collected.")
+        lines.append(f"`{render_coverage_bar(set(accumulated_chunks), accumulated_total)}`")
+        missing = [i for i in range(1, accumulated_total + 1) if i not in accumulated_chunks]
+        if missing:
+            ranges = compress_ranges(missing)
+            shown = ranges[:8]
+            more  = len(ranges) - len(shown)
+            lines.append("Missing: " + ", ".join(shown) + (
+                f" (+{more} more range{'s' if more != 1 else ''})" if more else ""
+            ))
     else:
         lines.append("No transfer in progress.")
 
@@ -415,7 +510,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif not is_busy:
         lines.append("Queue is empty.")
 
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -504,9 +599,21 @@ async def video_worker(bot):
             await job.status.update(f"✅ All done! Sent `{zip_path.name}` with {file_count} file(s).")
 
         except IncompleteTransfer as e:
-            shown = e.missing[:20]
-            more  = f" (+{len(e.missing) - 20} more)" if len(e.missing) > 20 else ""
-            # Cap the --resend command itself, not just the "shown" preview --
+            # Visual map of *where* the gaps are (a missing tail, a missing
+            # head, scattered misses) -- much faster to read than a list of
+            # numbers, especially for the common case of one big trailing gap.
+            coverage = render_coverage_bar(set(accumulated_chunks), e.total)
+
+            # Range-compressed display ("247-2624" instead of 2378 separate
+            # numbers) -- readable regardless of how many chunks are missing.
+            ranges = compress_ranges(e.missing)
+            shown_ranges = ranges[:12]
+            more_ranges  = len(ranges) - len(shown_ranges)
+            ranges_display = ", ".join(shown_ranges) + (
+                f" (+{more_ranges} more range{'s' if more_ranges != 1 else ''})" if more_ranges else ""
+            )
+
+            # Cap the --resend command itself, not just the display above --
             # a badly-scanned video can leave thousands of chunks missing,
             # and Telegram rejects any message over ~4096 chars outright.
             # Whatever doesn't fit just gets left for a follow-up video --
@@ -527,7 +634,8 @@ async def video_worker(bot):
             )
             await job.status.update(
                 f"📦 Got {e.found}/{e.total} chunks so far — progress saved.\n"
-                f"Still missing {len(e.missing)}: {shown}{more}\n\n"
+                f"`{coverage}`\n"
+                f"Missing: {ranges_display}\n\n"
                 f"On the sender PC, run:\n"
                 f"`python sender.py --resend {missing_str}`{resend_note}\n"
                 f"and send me that (shorter) video — no need to redo the whole thing.\n\n"

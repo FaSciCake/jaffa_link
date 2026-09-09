@@ -34,6 +34,21 @@ which decodes it back into files and returns a zip.
   crash outright, since the method didn't accept the kwarg at all).
   `/reset` abandons an in-progress transfer; `/status` reports transfer +
   queue progress; `/help` (aliases `/start`) lists commands.
+  `scan_video_sync()` downscales frames wider/taller than `MAX_SCAN_DIM`
+  (1600px) before handing them to zxing-cpp — barcode-detection cost scales
+  with pixel count, and a QR code doesn't need 1080p/4K to decode reliably.
+  Its progress bar shows *combined* transfer progress (baseline from earlier
+  videos + new chunks this video found), not just this video's own count —
+  otherwise a `--resend` video showing only late chunk indices displayed a
+  misleadingly tiny percentage against the whole-transfer total. The
+  IncompleteTransfer message and `/status` both render a `render_coverage_bar()`
+  strip (one character per slice of the index range, shaded by how present
+  that slice is) plus a `compress_ranges()` summary ("247-2624" instead of
+  2378 separate numbers) — the `--resend` command argument itself stays a
+  flat comma list since `sender.py --resend` doesn't parse range syntax, but
+  it's capped at `MAX_RESEND_LIST_CHARS` (Telegram rejects any message over
+  ~4096 chars — a large missing-chunk transfer blew right through that
+  before the cap existed).
 - **converter_config.py** — bot token + allowed Telegram user IDs.
   **Gitignored** (contains a live secret). Copy from
   `converter_config.example.py` and fill in real values.
