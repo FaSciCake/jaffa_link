@@ -48,16 +48,29 @@ which decodes it back into files and returns a zip.
   flat comma list since `sender.py --resend` doesn't parse range syntax, but
   it's capped at `MAX_RESEND_LIST_CHARS` (Telegram rejects any message over
   ~4096 chars — a large missing-chunk transfer blew right through that
-  before the cap existed).
+  before the cap existed). The bar is `[bracket-wrapped]` (an unbounded run
+  of "0%" characters with no border read as blank space, not "not started
+  yet"), and a slice that's merely *mostly* present is never rounded up to
+  the fully-present shade regardless of how small its gap is — otherwise a
+  couple of missing chunks in an 80+-chunk slice vanish from the picture and
+  a near-complete transfer looks indistinguishable from a finished one.
 - **converter_config.py** — bot token + allowed Telegram user IDs.
   **Gitignored** (contains a live secret). Copy from
   `converter_config.example.py` and fill in real values.
 - **test_pipeline.py** — end-to-end test of chunking/reassembly/checksum
   logic with synthetic frame data (no camera/video needed).
+- **outgoing_message/** — drop files here before running `sender.py` (or the
+  `send.*` launchers) with no folder argument. **Gitignored** (it's your
+  payload, not source).
 - **send.ps1** / **send.bat** — quick launchers for `sender.py`, using the
   `.venv-dev` interpreter directly (no manual activate needed). `send.bat`
   is double-click-friendly; both forward all CLI args, e.g.
-  `.\send.bat --chunk-size 2500` or `.\send.bat --resend 5,12,47`.
+  `.\send.bat --chunk-size 2500` or `.\send.bat --resend 5,12,47`. With no
+  folder argument, `send.ps1` defaults to `outgoing_message` (creating it if
+  needed) rather than falling through to sender.py's own default of the
+  current directory — running bare from this project's own root would
+  otherwise walk the whole repo, `converter_config.py`'s live bot token
+  included, straight into the QR slideshow.
 
 ## Wire format
 
@@ -79,7 +92,7 @@ repo together.
 ## Running
 
 ```
-.\send.bat                       # sender, scans current directory
+.\send.bat                       # sender, scans .\outgoing_message
 .\.venv-dev\Scripts\python.exe converter_bot.py   # bot, run on your own machine
 .\.venv-dev\Scripts\python.exe test_pipeline.py   # tests
 ```

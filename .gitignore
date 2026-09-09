@@ -19,6 +19,7 @@ __pycache__/
 received/
 archived/
 temp_videos/
+outgoing_message/
 
 # OS cruft
 Thumbs.db

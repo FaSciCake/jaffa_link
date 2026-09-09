@@ -118,7 +118,7 @@ def escape_backticks(text: str) -> str:
 
 
 COVERAGE_WIDTH  = 30
-COVERAGE_SHADES = " ░▒▓█"  # 5 levels: 0%, ~25%, ~50%, ~75%, 100% present
+COVERAGE_SHADES = "·░▒▓█"  # 5 levels: 0%, ~25%, ~50%, ~75%, 100% present
 
 
 def render_coverage_bar(present: set[int], total: int, width: int = COVERAGE_WIDTH) -> str:
@@ -126,18 +126,34 @@ def render_coverage_bar(present: set[int], total: int, width: int = COVERAGE_WID
     present. Each character is one equal-sized slice of the index range,
     shaded by how much of that slice has actually been collected -- so a
     missing tail, a missing head, or scattered gaps are all visible at a
-    glance instead of buried in a list of numbers."""
+    glance instead of buried in a list of numbers.
+
+    Wrapped in [brackets] so the bar's full extent is visible even when
+    most of it is still empty -- a run of bare "0%" characters with no
+    border was easy to mistake for blank space rather than "not started
+    yet". A slice that's merely *mostly* present is also never rounded up
+    to the fully-present shade, however small its gap -- otherwise a
+    near-complete transfer (e.g. missing 2 chunks out of an 87-chunk
+    slice) renders identically to a complete one and the handful of
+    missing chunks vanish from the picture entirely.
+    """
     if total <= 0:
-        return ""
+        return "[]"
+    max_level = len(COVERAGE_SHADES) - 1
     out = []
     for w in range(width):
         lo = int(w * total / width) + 1
         hi = max(lo, int((w + 1) * total / width))
+        span = hi - lo + 1
         have = sum(1 for i in range(lo, hi + 1) if i in present)
-        frac = have / (hi - lo + 1)
-        level = round(frac * (len(COVERAGE_SHADES) - 1))
+        if have == span:
+            level = max_level
+        elif have == 0:
+            level = 0
+        else:
+            level = max(1, min(max_level - 1, round(have / span * max_level)))
         out.append(COVERAGE_SHADES[level])
-    return "".join(out)
+    return f"[{''.join(out)}]"
 
 
 def compress_ranges(sorted_indices: list[int]) -> list[str]:
@@ -321,11 +337,11 @@ def scan_video_sync(video_path: Path, status: StatusMessage, loop: asyncio.Abstr
     # itself, so you still gain redundancy at higher frame rates without
     # scan time going up 1:1 with it.
     if fps <= 60:
-        STEP = 2
+        STEP = 1
     elif fps <= 120:
-        STEP = 3
+        STEP = 2
     else:
-        STEP = 5
+        STEP = 3
 
     chunks      = {}
     total_exp   = None

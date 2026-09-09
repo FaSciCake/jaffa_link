@@ -163,7 +163,7 @@ def make_qr_image(text: str):
 
 # ── PySide6 slideshow ──────────────────────────────────────────────────────────
 
-SLIDESHOW_HZ = 20  # auto-advance rate — must match what receiver expects
+SLIDESHOW_HZ = 10  # auto-advance rate — must match what receiver expects
 
 
 def suggest_codes_per_row(screen_w: int, screen_h: int, max_n: int = 6) -> int:
