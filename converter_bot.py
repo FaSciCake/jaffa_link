@@ -72,14 +72,19 @@ for d in (RECEIVED_DIR, ARCHIVE_DIR, TEMP_DIR):
 CHUNK_RE = re.compile(r'^(\d+)/(\d+):(.+)$')
 HASH_RE  = re.compile(r'^HASH:([0-9a-f]{64})$')
 
-# Minimum real time between progress-bar edits. Telegram's editMessageText
-# has an unofficial ~1/sec flood limit per chat; scanning a pre-recorded
+# Minimum real time between progress-bar edits. Scanning a pre-recorded
 # video isn't real-time-bound (cv2 decodes frames as fast as the CPU
 # allows), so gating purely on chunk count (the old "every 5 chunks" rule)
-# could fire edits many times a second on a fast decode and get flood-
-# limited. Gating on wall-clock time instead stays responsive without
-# tripping that limit, regardless of how fast any given video decodes.
-PROGRESS_EDIT_INTERVAL = 1.2  # seconds
+# could fire edits many times a second on a fast decode -- unnecessary API
+# load regardless of exactly where Telegram's own throttling kicks in.
+# Gating on wall-clock time keeps it responsive without that, independent
+# of how fast any given video happens to decode.
+PROGRESS_EDIT_INTERVAL = 0.8  # seconds
+
+# Telegram rejects any message text over ~4096 characters outright. A
+# badly-scanned video can leave hundreds or thousands of chunks missing --
+# see MAX_RESEND_LIST_CHARS usage in the IncompleteTransfer handler below.
+MAX_RESEND_LIST_CHARS = 3500
 
 is_busy = False  # True while the worker is actively processing a job (distinct from queue backlog)
 
@@ -154,13 +159,22 @@ class StatusMessage:
         Telegram was rendering it as literal asterisks and backticks instead
         of actually applying it.
         """
+        if not text.strip():
+            # Telegram rejects an edit with "Bad Request: message text is
+            # empty" -- guard against ever sending one instead of finding
+            # out from a failed HTTP call.
+            logger.warning("StatusMessage.update() called with blank text -- skipping edit.")
+            return
         if text == self._last and not force:
             return
         try:
             self._msg = await self._msg.edit_text(text, parse_mode=parse_mode)
             self._last = text
-        except TelegramError:
-            pass  # silently ignore edit failures (e.g. message too old)
+        except TelegramError as e:
+            # Was silently swallowed before -- log it so a failed edit (e.g.
+            # this exact "message too old" or "text is empty" case) actually
+            # shows up somewhere instead of just quietly not updating.
+            logger.warning("StatusMessage edit failed (%s) for text: %r", e, text[:300])
 
 
 # ── Core processing ────────────────────────────────────────────────────────────
@@ -492,12 +506,30 @@ async def video_worker(bot):
         except IncompleteTransfer as e:
             shown = e.missing[:20]
             more  = f" (+{len(e.missing) - 20} more)" if len(e.missing) > 20 else ""
-            missing_str = ",".join(str(i) for i in e.missing)
+            # Cap the --resend command itself, not just the "shown" preview --
+            # a badly-scanned video can leave thousands of chunks missing,
+            # and Telegram rejects any message over ~4096 chars outright.
+            # Whatever doesn't fit just gets left for a follow-up video --
+            # the queue already merges multiple uploads into one transfer.
+            included, running_len = [], 0
+            for i in e.missing:
+                piece = str(i)
+                added = len(piece) + (1 if included else 0)
+                if running_len + added > MAX_RESEND_LIST_CHARS:
+                    break
+                included.append(piece)
+                running_len += added
+            missing_str = ",".join(included)
+            leftover = len(e.missing) - len(included)
+            resend_note = (
+                f"\n(+{leftover} more after that — send a follow-up video for those once "
+                f"this one's merged in.)" if leftover else ""
+            )
             await job.status.update(
                 f"📦 Got {e.found}/{e.total} chunks so far — progress saved.\n"
                 f"Still missing {len(e.missing)}: {shown}{more}\n\n"
                 f"On the sender PC, run:\n"
-                f"`python sender.py --resend {missing_str}`\n"
+                f"`python sender.py --resend {missing_str}`{resend_note}\n"
                 f"and send me that (shorter) video — no need to redo the whole thing.\n\n"
                 f"Or send /reset to abandon this transfer and start over."
             )
