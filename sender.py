@@ -115,6 +115,76 @@ def build_chunks(entries: list[dict], chunk_size: int = 2000) -> tuple[list[str]
     return chunks, digest
 
 
+# ── --resend state tracking ────────────────────────────────────────────────────
+# --resend's chunk numbers only mean anything relative to the exact folder
+# contents + --chunk-size that produced them -- build_chunks() re-derives
+# total/digest from scratch on every run, with no memory of any earlier one.
+# If the folder changed at all since the run that produced the bot's
+# "missing: N" list (a file added/removed/edited, or even just a different
+# --chunk-size), the total (and every index's byte range) can silently
+# shift. A same-or-larger total that happens to still contain the requested
+# index slips right past a simple range check while still handing the
+# receiver a wrong payload for that index -- which surfaces downstream as a
+# baffling reset ("this upload's total doesn't match, starting over") or a
+# checksum failure, with nothing here to explain why. Persisting the state
+# of the last *full* (non---resend) send and validating --resend against it
+# catches the actual mismatch, at the source, with a specific diagnosis.
+
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sender_state.json")
+
+
+def file_manifest(entries: list[dict]) -> dict[str, str]:
+    """{rel_path: sha256 of the decoded file bytes} -- content fingerprint
+    independent of chunk-size/JSON-key-order, so it changes if and only if
+    a file was actually added, removed, or edited."""
+    return {e['p']: hashlib.sha256(base64.b64decode(e['d'])).hexdigest() for e in entries}
+
+
+def save_send_state(root: str, chunk_size: int, total: int, digest: str,
+                     manifest: dict, state_path: str = STATE_FILE):
+    with open(state_path, 'w') as f:
+        json.dump({
+            "root": os.path.abspath(root),
+            "chunk_size": chunk_size,
+            "total": total,
+            "digest": digest,
+            "manifest": manifest,
+        }, f, indent=2)
+
+
+def load_send_state(state_path: str = STATE_FILE) -> dict | None:
+    if not os.path.exists(state_path):
+        return None
+    try:
+        with open(state_path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def diff_send_state(prev: dict, root: str, chunk_size: int, manifest: dict) -> list[str]:
+    """Human-readable list of what changed vs. the last full send's
+    recorded state. Empty list means --resend is safe to proceed."""
+    problems = []
+    if os.path.abspath(root) != prev.get("root"):
+        problems.append(f"folder: now {os.path.abspath(root)!r}, was {prev.get('root')!r}")
+    if chunk_size != prev.get("chunk_size"):
+        problems.append(f"--chunk-size: now {chunk_size}, was {prev.get('chunk_size')}")
+
+    prev_manifest = prev.get("manifest", {})
+    added   = sorted(set(manifest) - set(prev_manifest))
+    removed = sorted(set(prev_manifest) - set(manifest))
+    changed = sorted(p for p in (set(manifest) & set(prev_manifest)) if manifest[p] != prev_manifest[p])
+    if added or removed or changed:
+        detail = []
+        if added:   detail.append(f"added: {', '.join(added)}")
+        if removed: detail.append(f"removed: {', '.join(removed)}")
+        if changed: detail.append(f"changed: {', '.join(changed)}")
+        problems.append("folder contents differ (" + "; ".join(detail) + ")")
+
+    return problems
+
+
 # ── Generate QR images ─────────────────────────────────────────────────────────
 
 def make_qr_image(text: str):
@@ -379,38 +449,45 @@ if __name__ == '__main__':
     print(f"\nFound {len(entries)} file(s).")
 
     data_chunks, digest = build_chunks(entries, chunk_size=args.chunk_size)
+    manifest = file_manifest(entries)
     print(f"Split into {len(data_chunks)} QR chunk(s). Checksum: {digest[:12]}…")
 
     if args.resend:
-        wanted     = {int(x) for x in args.resend.split(',')}
-        total_now  = len(data_chunks)  # indices 1..total_now, before filtering
-        out_of_range = sorted(i for i in wanted if i < 1 or i > total_now)
-        data_chunks = [c for c in data_chunks if int(c.split('/', 1)[0]) in wanted]
+        prev = load_send_state()
+        if prev is None:
+            print("\n⚠️  --resend given, but no record of a previous full send was found")
+            print(f"   (expected {STATE_FILE}).")
+            print("Run sender.py once WITHOUT --resend first -- that's what --resend's")
+            print("chunk numbers are relative to.")
+            sys.exit(1)
 
-        # build_chunks() re-derives everything from scratch on every run --
-        # total chunk count and each index's byte range both depend on
-        # --chunk-size and the exact folder contents. If either drifted
-        # since the run that produced the bot's "missing: N" numbers, a
-        # requested index may not exist in *this* run's chunking at all.
-        # That used to fail silently: data_chunks would end up empty (or
-        # missing some requested indices) and the slideshow would just
-        # show the HASH frame forever with nothing to decode -- which the
-        # bot then reports as the confusing "No QR chunks found in the
-        # video", with no hint that the mismatch was on this end.
+        problems = diff_send_state(prev, args.root, args.chunk_size, manifest)
+        if problems:
+            print("\n⚠️  --resend's chunk numbers only make sense against the exact same")
+            print("   content and settings as the full send that produced them. Since then:")
+            for p in problems:
+                print(f"     - {p}")
+            print("Restore the original folder contents and --chunk-size, or drop --resend")
+            print("and send the whole transfer again.")
+            sys.exit(1)
+
+        wanted    = {int(x) for x in args.resend.split(',')}
+        total_now = len(data_chunks)  # indices 1..total_now, before filtering
+        out_of_range = sorted(i for i in wanted if i < 1 or i > total_now)
+        data_chunks  = [c for c in data_chunks if int(c.split('/', 1)[0]) in wanted]
+
+        # Content+settings matched the last full send exactly (checked
+        # above), so this is really just a bad chunk number from the user --
+        # but still worth catching explicitly rather than silently looping
+        # a HASH-only slideshow with nothing to decode.
         if out_of_range or not data_chunks:
-            print(f"\n⚠️  --resend asked for chunk(s) {sorted(wanted)}, but this run only "
-                  f"produced {total_now} chunk(s) total"
-                  + (f" (out of range: {out_of_range})." if out_of_range else "."))
-            print("This almost always means --chunk-size or the source folder's contents")
-            print("don't match the run that produced those chunk numbers -- the bot's")
-            print("missing-chunk list only makes sense against that exact same chunking.")
-            print("Re-run with the same --chunk-size (and unchanged folder) as the original")
-            print("send, or drop --resend to resend the whole transfer.")
+            print(f"\n⚠️  --resend asked for chunk(s) {sorted(wanted)}, but there are only "
+                  f"{total_now} chunk(s) total" + (f" (out of range: {out_of_range})." if out_of_range else "."))
             sys.exit(1)
 
         print(f"--resend given: only looping {len(data_chunks)} chunk(s): {sorted(wanted)}")
-        print("(Make sure the folder contents haven't changed since the first attempt —")
-        print(" the checksum above needs to match what the bot already has.)")
+    else:
+        save_send_state(args.root, args.chunk_size, len(data_chunks), digest, manifest)
 
     # Always include the checksum frame, even on a --resend run, in case the
     # bot didn't catch it the first time either.

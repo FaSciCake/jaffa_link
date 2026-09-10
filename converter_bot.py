@@ -195,10 +195,16 @@ def reset_progress():
 class IncompleteTransfer(Exception):
     """Raised when, after merging this video's contribution, some chunks
     are still missing. Not a hard failure — progress is kept."""
-    def __init__(self, missing: list[int], found: int, total: int):
-        self.missing = missing
-        self.found   = found
-        self.total   = total
+    def __init__(self, missing: list[int], found: int, total: int, reset_note: str | None = None):
+        self.missing     = missing
+        self.found       = found
+        self.total       = total
+        # Set when this upload's chunk total didn't match the in-progress
+        # transfer's, so process_video wiped prior progress and started
+        # fresh from just this upload -- surfaced to the user rather than
+        # silently discarding whatever they'd already sent (see
+        # process_video's total-mismatch check).
+        self.reset_note  = reset_note
         super().__init__(f"{found}/{total} chunks collected, {len(missing)} still missing")
 
 
@@ -286,11 +292,24 @@ async def process_video(video_path: Path, status: StatusMessage, kind: str = "vi
         what = "photo" if kind == "image" else "video"
         raise ValueError(f"No QR chunks found in the {what}. Is this the right file?")
 
-    # If this video reports a different total than what's accumulated so
-    # far, treat it as a new/different transfer rather than mixing the two.
+    # If this upload reports a different total than what's accumulated so
+    # far, treat it as a new/different transfer rather than mixing the two
+    # -- most often because the sender re-ran sender.py against a folder
+    # whose contents (or --chunk-size) drifted from whatever produced the
+    # in-progress transfer's numbering, so this upload's chunk indices
+    # don't actually line up with the ones already collected.
+    reset_note = None
     if accumulated_total is not None and video_total != accumulated_total:
         logger.info("New transfer detected (total %s -> %s); resetting progress.",
                     accumulated_total, video_total)
+        reset_note = (
+            f"⚠️ This upload reports {video_total} total chunk(s), but the "
+            f"transfer in progress was tracking {accumulated_total} — treating "
+            f"this as a different transfer. The {len(baseline)} chunk(s) already "
+            f"collected were discarded (they don't correspond to the same "
+            f"chunking). If that's not what you meant, make sure the sender's "
+            f"folder contents and --chunk-size exactly match the original send."
+        )
         reset_progress()
 
     accumulated_total = video_total
@@ -300,7 +319,7 @@ async def process_video(video_path: Path, status: StatusMessage, kind: str = "vi
 
     missing = [i for i in range(1, accumulated_total + 1) if i not in accumulated_chunks]
     if missing:
-        raise IncompleteTransfer(missing, len(accumulated_chunks), accumulated_total)
+        raise IncompleteTransfer(missing, len(accumulated_chunks), accumulated_total, reset_note=reset_note)
 
     # Everything's here — reassemble, verify, write, zip
     await status.update(f"🔧 *Step 2/4* — Reassembling {accumulated_total} chunks…")
@@ -789,7 +808,9 @@ async def video_worker(bot):
                 f"\n(+{leftover} more after that — send a follow-up video for those once "
                 f"this one's merged in.)" if leftover else ""
             )
+            reset_prefix = f"{e.reset_note}\n\n" if e.reset_note else ""
             await job.status.update(
+                f"{reset_prefix}"
                 f"📦 Got {e.found}/{e.total} chunks so far — progress saved.\n"
                 f"`{coverage}`\n"
                 f"Missing: {ranges_display}\n\n"

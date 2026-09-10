@@ -17,14 +17,24 @@ which decodes it back into files and returns a zip.
   back to `range(8)` if ever needed). `run_slideshow()` auto-picks how many
   QR codes to show side by side per slide (`suggest_codes_per_row()`, lands
   on 2 for a 16:9 screen — a square code sized to screen height wastes the
-  extra width otherwise); override with `--codes-per-row`. `--resend`
-  rebuilds the chunk list from scratch each run (same folder walk + same
-  `--chunk-size` as any other run), so a requested index only makes sense
-  if both match whatever run produced the bot's "missing: N" numbers — if
-  a requested index falls outside the freshly-rebuilt range, `--resend`
-  now refuses to proceed (loud error, exit 1) rather than silently
-  looping a HASH-only slideshow with nothing to decode, which used to
-  surface on the receiving end as a baffling "No QR chunks found".
+  extra width otherwise); override with `--codes-per-row`.
+  `--resend`'s chunk numbers are only meaningful relative to the exact
+  folder contents + `--chunk-size` that produced them, but `build_chunks()`
+  re-derives total/digest from scratch on every run with no memory of any
+  earlier one — a file added/removed/edited (or a different `--chunk-size`)
+  since the original send silently shifts every index's byte range, and a
+  same-or-larger total that happens to still contain the requested index
+  slips past a plain range check while still handing the receiver a wrong
+  payload for it. A normal (non-`--resend`) run now writes its
+  chunk-size/total/digest/per-file-sha256 manifest to `sender_state.json`
+  (`save_send_state()`, gitignored — it's local run state, not source);
+  `--resend` loads it and diffs the current folder against it
+  (`diff_send_state()`) before doing anything else, refusing with a
+  specific diagnosis (which file changed, or `--chunk-size`/folder path
+  differs) if they don't match, or if no prior full send was recorded at
+  all. This is what actually catches drift a plain out-of-range check
+  can't — the followup guard against an index outside the freshly-rebuilt
+  total is kept too, as a cheap fallback.
 - **converter_bot.py** — Telegram bot (python-telegram-bot). Downloads each
   uploaded video or photo immediately, then hands it to a single
   background `video_worker()` task that processes queued jobs one at a
@@ -46,7 +56,16 @@ which decodes it back into files and returns a zip.
   site in the IncompleteTransfer path that *did* pass `parse_mode=` used to
   crash outright, since the method didn't accept the kwarg at all).
   `/reset` abandons an in-progress transfer; `/status` reports transfer +
-  queue progress; `/help` (aliases `/start`) lists commands.
+  queue progress; `/help` (aliases `/start`) lists commands. If an
+  upload's chunk total disagrees with the transfer already in progress,
+  `process_video()` treats it as a different transfer and discards the
+  old progress (it was never going to reassemble correctly against a
+  different chunking anyway) — but says so explicitly via
+  `IncompleteTransfer.reset_note`, prepended to the next status message,
+  instead of silently vanishing the chunks the user already sent (which
+  read as "combining broke" rather than what it actually was: a mismatch
+  on the sender side, most commonly `sender.py --resend` run against
+  drifted folder contents — see `sender_state.json` above).
   `scan_video_sync()` downscales frames wider/taller than `MAX_SCAN_DIM`
   (1600px) before handing them to zxing-cpp — barcode-detection cost scales
   with pixel count, and a QR code doesn't need 1080p/4K to decode reliably.

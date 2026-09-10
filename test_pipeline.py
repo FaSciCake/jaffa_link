@@ -234,6 +234,66 @@ async def main():
     print(f"\nImage-scan test -> real QR encode/decode round trip via photo succeeded "
           f"(chunk {sample_idx}, hash captured)")
 
+    # ---- 9. sender.py --resend state validation: catches a folder whose
+    #         contents drifted since the last full send, even in cases a
+    #         plain chunk-count range check can't -- e.g. the folder shrank
+    #         by one file but the requested index still happens to fall
+    #         within the (now-different) total. ---------------------------
+    state_dir   = Path(tempfile.mkdtemp(prefix="qrtest_state_"))
+    payload_dir = state_dir / "payload"
+    payload_dir.mkdir()
+    (payload_dir / "only.txt").write_text("original content for state test\n")
+    state_path = str(state_dir / "sender_state.json")
+
+    orig_entries  = sender.collect_files(str(payload_dir))
+    orig_chunks, orig_digest = sender.build_chunks(orig_entries, chunk_size=40)
+    orig_manifest = sender.file_manifest(orig_entries)
+    sender.save_send_state(str(payload_dir), 40, len(orig_chunks), orig_digest, orig_manifest, state_path=state_path)
+
+    loaded = sender.load_send_state(state_path)
+    assert loaded is not None and loaded["digest"] == orig_digest
+    assert sender.diff_send_state(loaded, str(payload_dir), 40, orig_manifest) == [], \
+        "unchanged folder/settings should report no problems"
+
+    # Change the folder contents (mirroring what apparently happened between
+    # the user's original send and their later --resend run) and confirm
+    # the mismatch is caught with a specific diagnosis, not silently.
+    (payload_dir / "only.txt").write_text("different content now\n")
+    changed_manifest = sender.file_manifest(sender.collect_files(str(payload_dir)))
+    problems = sender.diff_send_state(loaded, str(payload_dir), 40, changed_manifest)
+    assert problems and any("only.txt" in p for p in problems), \
+        f"expected the changed file to be flagged, got: {problems}"
+    print(f"\n--resend state-validation test -> content drift correctly caught: {problems}")
+    shutil.rmtree(state_dir)
+
+    # ---- 10. A chunk-total mismatch against an in-progress transfer must
+    #          be surfaced to the user (reset_note), not just silently wipe
+    #          their already-collected chunks -- that silence is exactly
+    #          what made a legitimate reset look like a "combining broke"
+    #          bug from the user's side. -----------------------------------
+    cb.reset_progress()
+    first_chunks = {1: "aaa", 2: "bbb"}  # total=5, 3 still missing
+    cb.scan_video_sync = lambda video_path, status, loop, baseline=frozenset(): (first_chunks, 5, None)
+    try:
+        await cb.process_video(dummy_path, status)
+        raise SystemExit("FAIL: expected IncompleteTransfer for the first (5-total) upload")
+    except cb.IncompleteTransfer as e:
+        assert e.reset_note is None, "the first upload of a transfer should not report a reset"
+    assert cb.accumulated_total == 5 and len(cb.accumulated_chunks) == 2
+
+    second_chunks = {1: "ccc"}  # total=9 now -- disagrees with the 5 already in progress
+    cb.scan_video_sync = lambda video_path, status, loop, baseline=frozenset(): (second_chunks, 9, None)
+    try:
+        await cb.process_video(dummy_path, status)
+        raise SystemExit("FAIL: expected IncompleteTransfer for the mismatched-total upload")
+    except cb.IncompleteTransfer as e:
+        assert e.reset_note is not None, "a total mismatch must surface a reset_note to the user"
+        assert "2 chunk(s)" in e.reset_note, f"reset_note should mention the discarded count: {e.reset_note!r}"
+    assert cb.accumulated_total == 9 and set(cb.accumulated_chunks) == {1}, \
+        "old chunks from the mismatched transfer must not linger after the reset"
+    cb.reset_progress()
+    print("Total-mismatch reset -> correctly surfaced to the user via reset_note")
+
     shutil.rmtree(src)
     shutil.rmtree(extract_dir)
     shutil.rmtree(img_dir)
