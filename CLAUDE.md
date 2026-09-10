@@ -76,10 +76,29 @@ which decodes it back into files and returns a zip.
 
 Each QR frame is a plain string, one of:
 - `HASH:<sha256 hex>` — checksum of the full base45 payload, sent once.
-- `<index>/<total>:<base45 chunk>` — one piece of the payload, 1-indexed.
+- `<index>/<total>/<checksum>:<base45 chunk>` — one piece of the payload,
+  1-indexed. `<checksum>` is the first 8 hex chars of `sha256(payload)`,
+  checked by `scan_video_sync()` before a decoded chunk is ever stored.
+  zxing-cpp can report a frame as "valid" even when it's been corrupted past
+  what the QR's own error correction (`ERROR_CORRECT_L`) can recover —
+  motion blur or video-compression artifacts on a fast-changing slideshow
+  are enough. Without this, such a frame silently poisoned that chunk index
+  for the rest of the scan (first successful-looking decode wins, per
+  index) and the corruption only surfaced as a whole-payload hash mismatch
+  at the very end, with no way to tell which chunk was bad or let a later,
+  cleaner loop-pass of the same slideshow (or a follow-up video) correct
+  it. A frame that fails its own checksum is now just discarded — treated
+  as not-yet-seen — so a subsequent good read of the same index, in this
+  video or a later one, still gets accepted normally.
 
 The receiver de-dupes by index and can complete a transfer from multiple
-partial videos as long as the reported `total` matches across them.
+partial videos as long as the reported `total` matches across them. If the
+final whole-payload checksum still doesn't match after every chunk has
+individually passed its own checksum, `process_video()` clears the
+accumulated transfer state (`reset_progress()`) before raising — otherwise
+a resend's baseline started out already "100% collected" (just wrong),
+which made `/status` and the scan progress bar read as permanently stuck
+instead of the retry actually restarting from zero.
 
 ## Environment
 

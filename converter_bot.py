@@ -69,7 +69,7 @@ for d in (RECEIVED_DIR, ARCHIVE_DIR, TEMP_DIR):
 
 # ── State — one job at a time, chunks accumulate across uploads ────────────────
 
-CHUNK_RE = re.compile(r'^(\d+)/(\d+):(.+)$')
+CHUNK_RE = re.compile(r'^(\d+)/(\d+)/([0-9a-f]{8}):(.+)$')
 HASH_RE  = re.compile(r'^HASH:([0-9a-f]{64})$')
 
 # Minimum real time between progress-bar edits. Scanning a pre-recorded
@@ -293,10 +293,23 @@ async def process_video(video_path: Path, status: StatusMessage) -> tuple[Path, 
     if accumulated_hash:
         actual = hashlib.sha256(reassembled_b45.encode('ascii')).hexdigest()
         if actual != accumulated_hash:
+            # Every chunk *looked* complete (each passed its own per-chunk
+            # checksum) yet the whole payload still doesn't match -- treat
+            # this transfer as unrecoverable rather than leaving the bad
+            # "complete" state accumulated. Keeping it around used to mean
+            # the next attempt's baseline was already 100% full of the bad
+            # data: /status and the scan progress bar would show N/N the
+            # instant the new video started (nothing left to count as
+            # "new"), making a fresh retry look stuck rather than actually
+            # restarting -- and it would keep re-merging over the same
+            # already-corrupt entries instead of starting clean.
+            expected_prefix = accumulated_hash[:12]
+            reset_progress()
             raise ValueError(
                 f"Checksum mismatch after reassembly "
-                f"(expected {accumulated_hash[:12]}…, got {actual[:12]}…). "
-                f"Some chunk decoded incorrectly — please re-record and try again."
+                f"(expected {expected_prefix}…, got {actual[:12]}…). "
+                f"Some chunk decoded incorrectly. Progress for this transfer "
+                f"has been cleared — please re-record and resend the full video."
             )
     else:
         logger.warning("No checksum (HASH:) frame was captured — skipping integrity check.")
@@ -357,6 +370,10 @@ def scan_video_sync(video_path: Path, status: StatusMessage, loop: asyncio.Abstr
     last_edit_at = 0.0  # time.monotonic() of the last progress-bar edit
     scan_start   = time.monotonic()
     new_found    = 0    # chunks this video contributed that weren't already in baseline
+    rejected     = 0    # frames that decoded to a valid-looking chunk whose
+                         # payload failed its own checksum -- discarded rather
+                         # than trusted, so a later loop-pass (same video) or
+                         # a follow-up video can still supply a clean read
 
     while True:
         ret, frame = cap.read()
@@ -389,7 +406,24 @@ def scan_video_sync(video_path: Path, status: StatusMessage, loop: asyncio.Abstr
                 if not m:
                     continue
 
-                idx, total, payload = int(m.group(1)), int(m.group(2)), m.group(3)
+                idx, total, chunk_cs, payload = (
+                    int(m.group(1)), int(m.group(2)), m.group(3), m.group(4)
+                )
+
+                # zxing-cpp can report a frame as "valid" even when video
+                # compression / motion blur corrupted it past what the QR's
+                # own error correction could recover -- especially likely at
+                # ERROR_CORRECT_L. Checking the chunk's own checksum catches
+                # that here, per-chunk, instead of only finding out via the
+                # whole-payload hash at the very end of the transfer (see
+                # sender.py's build_chunks() docstring). A rejected read is
+                # simply not stored, so a cleaner read of the same index --
+                # later in this same looping video, or in a follow-up video
+                # -- can still fill it in normally.
+                if hashlib.sha256(payload.encode('ascii')).hexdigest()[:8] != chunk_cs:
+                    rejected += 1
+                    continue
+
                 if total_exp is None:
                     total_exp = total
                 if idx not in chunks:
@@ -437,6 +471,8 @@ def scan_video_sync(video_path: Path, status: StatusMessage, loop: asyncio.Abstr
             break
 
     cap.release()
+    if rejected:
+        logger.info("Discarded %d chunk read(s) that failed their per-chunk checksum.", rejected)
     return chunks, total_exp, found_hash
 
 

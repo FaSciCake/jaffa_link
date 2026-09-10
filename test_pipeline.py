@@ -9,6 +9,7 @@ zipping) runs for real.
 """
 import asyncio
 import filecmp
+import hashlib
 import os
 import random
 import shutil
@@ -28,7 +29,9 @@ class FakeStatus:
 
 
 def parse_frames_to_scan_result(frames):
-    """Mimic what scan_video_sync's inner loop does, using the real regexes."""
+    """Mimic what scan_video_sync's inner loop does, using the real regexes
+    -- including rejecting a chunk whose payload fails its own per-chunk
+    checksum, same as a corrupted-but-"valid" QR read would be rejected."""
     chunks = {}
     total_exp = None
     found_hash = None
@@ -40,7 +43,9 @@ def parse_frames_to_scan_result(frames):
         m = cb.CHUNK_RE.match(text)
         if not m:
             continue
-        idx, total, payload = int(m.group(1)), int(m.group(2)), m.group(3)
+        idx, total, chunk_cs, payload = int(m.group(1)), int(m.group(2)), m.group(3), m.group(4)
+        if hashlib.sha256(payload.encode('ascii')).hexdigest()[:8] != chunk_cs:
+            continue
         if total_exp is None:
             total_exp = total
         chunks[idx] = payload
@@ -143,6 +148,34 @@ async def main():
     except ValueError as e:
         assert "Checksum mismatch" in str(e), f"wrong error: {e}"
         print(f"\nCorruption test -> correctly caught: {e}")
+    assert cb.accumulated_total is None, (
+        "progress must be cleared after a checksum-mismatch failure -- otherwise "
+        "the next resend starts from a baseline that's already 'full' of the bad "
+        "data, and its scan progress / \"/status\" reads as stuck at 100% instead "
+        "of restarting cleanly"
+    )
+    print("Progress correctly cleared after checksum failure.")
+
+    # ---- 7. Per-chunk checksum: a frame whose payload was altered in transit
+    #         (simulating a QR misread that zxing-cpp still reported as
+    #         "valid") must be discarded without being stored -- and a later,
+    #         clean read of the same chunk index (the point of the slideshow
+    #         looping) must still be able to fill it in normally. -----------
+    sample_chunk               = data_chunks[0]
+    idx_str, rest              = sample_chunk.split('/', 1)
+    total_str, cs_and_payload  = rest.split('/', 1)
+    cs_str, good_payload       = cs_and_payload.split(':', 1)
+    bad_payload = ('A' if good_payload[0] != 'A' else 'B') + good_payload[1:]
+    bad_frame   = f"{idx_str}/{total_str}/{cs_str}:{bad_payload}"  # checksum now stale
+
+    only_bad_chunks, _, _ = parse_frames_to_scan_result([bad_frame])
+    assert int(idx_str) not in only_bad_chunks, \
+        "a chunk whose payload fails its own checksum must be discarded, not stored"
+
+    recovered_chunks, _, _ = parse_frames_to_scan_result([bad_frame, sample_chunk])
+    assert recovered_chunks.get(int(idx_str)) == good_payload, \
+        "a later clean read of the same chunk index should still be accepted"
+    print("Per-chunk checksum test -> corrupted read rejected, later clean read accepted")
 
     shutil.rmtree(src)
     shutil.rmtree(extract_dir)

@@ -76,11 +76,25 @@ def build_chunks(entries: list[dict], chunk_size: int = 2000) -> tuple[list[str]
     """
     Serialize entries to JSON, base45-encode the result, then split into
     chunk_size-character pieces. Each data chunk is a plain string:
-    "INDEX/TOTAL:payload" — payload is a slice of the base45 text.
+    "INDEX/TOTAL/CHECKSUM:payload" — payload is a slice of the base45 text,
+    CHECKSUM is the first 8 hex chars of sha256(payload).
+
+    The per-chunk checksum exists because a single QR frame can be
+    misread by the camera/video pipeline in a way that still passes
+    zxing-cpp's own validity check (e.g. under ERROR_CORRECT_L, motion
+    blur or video-compression artifacts can push a frame past what the
+    QR's built-in error correction can recover, but not past what it
+    reports as "valid"). Without a way to catch that per chunk, a single
+    bad frame anywhere in a large transfer only surfaces as a whole-payload
+    checksum mismatch at the very end, with no way to tell which chunk was
+    bad or to let a later, cleaner read of the same chunk (the slideshow
+    loops precisely to offer that) correct it. See CHUNK_RE / scan_video_sync
+    in converter_bot.py for the receiving side.
 
     Returns (chunks, sha256_hex) — sha256_hex is the checksum of the full
-    base45 text, so the receiver can verify the reassembled data actually
-    matches what was sent (see the HASH: frame in __main__).
+    base45 text, so the receiver can also verify the fully reassembled data
+    matches what was sent (see the HASH: frame in __main__) as a final,
+    whole-payload safety net on top of the per-chunk one.
 
     Note: json.dumps() with the default ensure_ascii=True already produces
     pure-ASCII text (any non-ASCII gets \\uXXXX-escaped), so there's no need
@@ -94,8 +108,9 @@ def build_chunks(entries: list[dict], chunk_size: int = 2000) -> tuple[list[str]
     total  = math.ceil(len(full_b45) / chunk_size)
     chunks = []
     for i in range(total):
-        piece = full_b45[i * chunk_size : (i + 1) * chunk_size]
-        chunks.append(f"{i+1}/{total}:{piece}")
+        piece    = full_b45[i * chunk_size : (i + 1) * chunk_size]
+        piece_cs = hashlib.sha256(piece.encode('ascii')).hexdigest()[:8]
+        chunks.append(f"{i+1}/{total}/{piece_cs}:{piece}")
 
     return chunks, digest
 
