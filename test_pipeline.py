@@ -18,9 +18,45 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+import cv2
+import numpy as np
+
 sys.path.insert(0, os.path.dirname(__file__))
 import sender
 import converter_bot as cb
+
+
+def render_qr_frame_image(texts: list[str], box: int = 6, gap: int = 20, border: int = 4) -> np.ndarray:
+    """Render one or more QR codes side by side into a single grayscale-ish
+    BGR image, mimicking a multi-code slide -- without needing PySide6 or
+    Pillow (neither is a hard dependency of the receiving side). Uses the
+    same qrcode.QRCode + get_matrix() approach sender.py's make_qr_image()
+    uses, just rasterized with numpy/cv2 instead of Qt."""
+    import qrcode
+
+    imgs = []
+    for text in texts:
+        qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=1, border=border)
+        qr.add_data(text)
+        qr.make(fit=True)
+        matrix = qr.get_matrix()
+        size = len(matrix)
+        arr = np.full((size, size), 255, dtype=np.uint8)
+        for y, row in enumerate(matrix):
+            for x, dark in enumerate(row):
+                if dark:
+                    arr[y, x] = 0
+        arr = cv2.resize(arr, (size * box, size * box), interpolation=cv2.INTER_NEAREST)
+        imgs.append(arr)
+
+    h = max(im.shape[0] for im in imgs)
+    total_w = sum(im.shape[1] for im in imgs) + gap * (len(imgs) - 1)
+    canvas = np.full((h, total_w), 255, dtype=np.uint8)
+    x = 0
+    for im in imgs:
+        canvas[0:im.shape[0], x:x + im.shape[1]] = im
+        x += im.shape[1] + gap
+    return cv2.cvtColor(canvas, cv2.COLOR_GRAY2BGR)
 
 
 class FakeStatus:
@@ -177,8 +213,30 @@ async def main():
         "a later clean read of the same chunk index should still be accepted"
     print("Per-chunk checksum test -> corrupted read rejected, later clean read accepted")
 
+    # ---- 8. Real image-scan integration test: render actual QR codes (not
+    #         mocked) for the HASH frame + one data chunk into a single PNG
+    #         -- as if photographing one multi-code slide -- and run them
+    #         through the real scan_image_sync. Exercises the actual
+    #         qrcode-encode -> zxing-cpp-decode round trip for the new
+    #         photo-upload path, not just regex parsing of pre-made strings.
+    img_dir  = Path(tempfile.mkdtemp(prefix="qrtest_img_"))
+    img_path = img_dir / "frame.png"
+    img = render_qr_frame_image([f"HASH:{digest}", sample_chunk])
+    cv2.imwrite(str(img_path), img)
+
+    img_chunks, img_total, img_hash = cb.scan_image_sync(img_path)
+    sample_idx     = int(idx_str)
+    sample_payload = good_payload
+    assert img_hash == digest, "HASH frame should be read from the photo"
+    assert img_total == full_total, f"expected total={full_total}, got {img_total}"
+    assert img_chunks.get(sample_idx) == sample_payload, \
+        "chunk payload decoded from the photo should match what was encoded"
+    print(f"\nImage-scan test -> real QR encode/decode round trip via photo succeeded "
+          f"(chunk {sample_idx}, hash captured)")
+
     shutil.rmtree(src)
     shutil.rmtree(extract_dir)
+    shutil.rmtree(img_dir)
     print("\nALL TESTS PASSED")
 
 

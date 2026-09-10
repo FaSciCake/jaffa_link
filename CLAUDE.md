@@ -17,16 +17,29 @@ which decodes it back into files and returns a zip.
   back to `range(8)` if ever needed). `run_slideshow()` auto-picks how many
   QR codes to show side by side per slide (`suggest_codes_per_row()`, lands
   on 2 for a 16:9 screen — a square code sized to screen height wastes the
-  extra width otherwise); override with `--codes-per-row`.
+  extra width otherwise); override with `--codes-per-row`. `--resend`
+  rebuilds the chunk list from scratch each run (same folder walk + same
+  `--chunk-size` as any other run), so a requested index only makes sense
+  if both match whatever run produced the bot's "missing: N" numbers — if
+  a requested index falls outside the freshly-rebuilt range, `--resend`
+  now refuses to proceed (loud error, exit 1) rather than silently
+  looping a HASH-only slideshow with nothing to decode, which used to
+  surface on the receiving end as a baffling "No QR chunks found".
 - **converter_bot.py** — Telegram bot (python-telegram-bot). Downloads each
-  uploaded video immediately, then hands it to a single background
-  `video_worker()` task that processes queued videos one at a time in
-  receipt order — so several uploads (a transfer split across videos, or
-  just sent in a burst) merge into the same transfer via the same
-  accumulation logic used for `--resend` top-ups, instead of later ones
-  being rejected while an earlier one is still scanning. Scans frames with
-  zxing-cpp/opencv, reassembles chunks by index, verifies the sha256
-  checksum, writes files, zips, sends back. `StatusMessage.update()`
+  uploaded video or photo immediately, then hands it to a single
+  background `video_worker()` task that processes queued jobs one at a
+  time in receipt order — so several uploads (a transfer split across
+  videos, or just sent in a burst) merge into the same transfer via the
+  same accumulation logic used for `--resend` top-ups, instead of later
+  ones being rejected while an earlier one is still scanning. A single
+  *photo* of one QR frame is also accepted (`scan_image_sync()`, no frame
+  loop — just one zxing-cpp pass) — convenient for topping up a chunk or
+  two without filming a video of a slide that never changes; Telegram's
+  photo compression is fine here since a corrupted read just fails its
+  own per-chunk checksum and gets skipped rather than silently accepted.
+  Scans frames with zxing-cpp/opencv, reassembles chunks by index,
+  verifies the sha256 checksum, writes files, zips, sends back.
+  `StatusMessage.update()`
   defaults `parse_mode="Markdown"` — every call site's text already used
   `*bold*`/`` `code` `` formatting, so a call that didn't pass parse_mode
   explicitly used to render the markup as literal characters (and one call

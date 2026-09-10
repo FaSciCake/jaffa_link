@@ -72,6 +72,9 @@ for d in (RECEIVED_DIR, ARCHIVE_DIR, TEMP_DIR):
 CHUNK_RE = re.compile(r'^(\d+)/(\d+)/([0-9a-f]{8}):(.+)$')
 HASH_RE  = re.compile(r'^HASH:([0-9a-f]{64})$')
 
+VIDEO_EXTENSIONS = (".mov", ".mp4", ".avi", ".mkv")
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+
 # Minimum real time between progress-bar edits. Scanning a pre-recorded
 # video isn't real-time-bound (cv2 decodes frames as fast as the CPU
 # allows), so gating purely on chunk count (the old "every 5 chunks" rule)
@@ -109,6 +112,7 @@ class VideoJob:
     fname:      str
     status:     "StatusMessage"
     chat_id:    int
+    kind:       str = "video"  # "video" or "image" -- picks scan_video_sync vs scan_image_sync
 
 
 def escape_backticks(text: str) -> str:
@@ -242,31 +246,45 @@ class StatusMessage:
 
 # ── Core processing ────────────────────────────────────────────────────────────
 
-async def process_video(video_path: Path, status: StatusMessage) -> tuple[Path, int]:
+async def process_video(video_path: Path, status: StatusMessage, kind: str = "video") -> tuple[Path, int]:
     """
-    Full pipeline for one uploaded video: scan → merge into the running
-    transfer → (if complete) verify checksum → reassemble → write → zip.
+    Full pipeline for one uploaded video or image: scan → merge into the
+    running transfer → (if complete) verify checksum → reassemble → write →
+    zip.
+
+    `kind` picks the scanner: "video" walks frames with scan_video_sync
+    (the original camera-recording path); "image" hands a single still
+    photo to scan_image_sync -- handy for topping up just one or two
+    missing chunks via `--resend`, where filming a video of a code that
+    never even changes slides is more fiddly than just snapping a photo.
 
     Raises IncompleteTransfer if chunks are still missing after merging
-    this video's contribution (progress is kept for the next upload).
+    this upload's contribution (progress is kept for the next one).
     """
     global accumulated_chunks, accumulated_total, accumulated_hash
     loop = asyncio.get_event_loop()
 
     # Snapshot rather than handing the live dict into the executor thread --
-    # scan_video_sync only reads it (for combined-progress display), and a
+    # the scanners only read it (for combined-progress display), and a
     # snapshot avoids any doubt about touching shared state cross-thread.
     baseline = set(accumulated_chunks)
     continuing_note = f" (continuing from {len(baseline)}/{accumulated_total})" if baseline else ""
 
-    # Step 1 — Scan video frames
-    await status.update(f"🎬 *Step 1/4* — Scanning video frames…{continuing_note}")
-    video_chunks, video_total, video_hash = await loop.run_in_executor(
-        None, scan_video_sync, video_path, status, loop, baseline
-    )
+    # Step 1 — Scan
+    if kind == "image":
+        await status.update(f"🖼 *Step 1/4* — Scanning photo…{continuing_note}")
+        video_chunks, video_total, video_hash = await loop.run_in_executor(
+            None, scan_image_sync, video_path, baseline
+        )
+    else:
+        await status.update(f"🎬 *Step 1/4* — Scanning video frames…{continuing_note}")
+        video_chunks, video_total, video_hash = await loop.run_in_executor(
+            None, scan_video_sync, video_path, status, loop, baseline
+        )
 
     if not video_chunks or video_total is None:
-        raise ValueError("No QR chunks found in the video. Is this the right file?")
+        what = "photo" if kind == "image" else "video"
+        raise ValueError(f"No QR chunks found in the {what}. Is this the right file?")
 
     # If this video reports a different total than what's accumulated so
     # far, treat it as a new/different transfer rather than mixing the two.
@@ -476,6 +494,64 @@ def scan_video_sync(video_path: Path, status: StatusMessage, loop: asyncio.Abstr
     return chunks, total_exp, found_hash
 
 
+def scan_image_sync(image_path: Path, baseline: set[int] = frozenset()):
+    """Blocking single-photo scan — called in executor.
+
+    Same chunk-parsing and per-chunk checksum verification as
+    scan_video_sync, but for one still image instead of a video: there's
+    no frame loop, no slide-transition handling, no early-break condition
+    -- zxing-cpp just reads whatever barcodes are visible in the one
+    frame. Useful for topping up a couple of missing chunks (see
+    IncompleteTransfer's `--resend` suggestion): filming a video of a QR
+    slide that never even changes is more fiddly than just snapping a
+    photo of it. `baseline` is accepted for signature parity with
+    scan_video_sync (process_video passes it either way) but isn't used
+    here since there's no in-progress bar to render mid-scan.
+    """
+    frame = cv2.imread(str(image_path))
+    if frame is None:
+        raise RuntimeError(f"Cannot open image: {image_path}")
+
+    h, w = frame.shape[:2]
+    if max(h, w) > MAX_SCAN_DIM:
+        scale = MAX_SCAN_DIM / max(h, w)
+        frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+    chunks     = {}
+    total_exp  = None
+    found_hash = None
+    rejected   = 0
+
+    for r in zxingcpp.read_barcodes(frame):
+        if not r.valid:
+            continue
+        text = r.text.strip()
+
+        hm = HASH_RE.match(text)
+        if hm:
+            found_hash = hm.group(1)
+            continue
+
+        m = CHUNK_RE.match(text)
+        if not m:
+            continue
+
+        idx, total, chunk_cs, payload = (
+            int(m.group(1)), int(m.group(2)), m.group(3), m.group(4)
+        )
+        if hashlib.sha256(payload.encode('ascii')).hexdigest()[:8] != chunk_cs:
+            rejected += 1
+            continue
+
+        if total_exp is None:
+            total_exp = total
+        chunks[idx] = payload
+
+    if rejected:
+        logger.info("Discarded %d chunk read(s) that failed their per-chunk checksum (photo scan).", rejected)
+    return chunks, total_exp, found_hash
+
+
 def reassemble_sync(chunks: dict, total_exp: int) -> str:
     """Concatenate chunk payloads back into the full base45 text."""
     return "".join(chunks[i] for i in range(1, total_exp + 1))
@@ -524,11 +600,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 *QR Converter Bot* is ready!\n\n"
         "Send me a video file (`.mov` or `.mp4`) recorded from the QR slideshow. "
         "I'll decode it and send back a zip with all the files.\n\n"
-        "Send several videos back-to-back (or while one's still processing) "
+        "You can also send a single *photo* of one QR frame — handy for "
+        "topping up just a chunk or two without filming a whole video.\n\n"
+        "Send several uploads back-to-back (or while one's still processing) "
         "and I'll queue them, working through them in order and merging "
         "chunks into the same transfer automatically.\n\n"
-        "If a video is missing some chunks, I'll keep what I've got — just "
-        "send a top-up video and it'll merge in.\n\n"
+        "If an upload is missing some chunks, I'll keep what I've got — just "
+        "send a top-up video or photo and it'll merge in.\n\n"
         "/status — check transfer + queue progress\n"
         "/reset — abandon the in-progress transfer\n"
         "/help — show this again",
@@ -576,56 +654,83 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Nothing in progress — already clear.")
 
 
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_allowed(user_id):
         return
 
-    # Only accept document uploads (phone videos sent as files, not compressed)
     msg = update.message
-    doc = msg.document or msg.video
-    if not doc:
-        await msg.reply_text("Please send the video as a *file* (not compressed). Use 'Send as File' in Telegram.", parse_mode="Markdown")
-        return
 
-    # Check extension loosely
-    fname = doc.file_name or f"video_{msg.message_id}.mp4"
-    if not any(fname.lower().endswith(ext) for ext in (".mov", ".mp4", ".avi", ".mkv")):
-        await msg.reply_text(f"Unexpected file type: `{escape_backticks(fname)}`\nExpected a .mov or .mp4 video.", parse_mode="Markdown")
-        return
+    # A compressed photo (msg.photo) is a list of resolutions -- take the
+    # largest. It's convenient for topping up just one or two missing
+    # chunks (no need to film a video of a QR slide that never changes),
+    # and Telegram's photo compression is fine here: a chunk that comes
+    # out corrupted just fails its own per-chunk checksum and gets
+    # skipped, same as a bad video frame would (see CHUNK_RE / scan_image_sync).
+    if msg.photo:
+        tg_obj = msg.photo[-1]
+        fname  = f"photo_{msg.message_id}.jpg"
+        kind   = "image"
+    else:
+        doc = msg.document or msg.video
+        if not doc:
+            await msg.reply_text(
+                "Send a video file (`.mov`/`.mp4`, as a *file* for best quality) "
+                "recorded from the QR slideshow, or a single *photo* of one QR "
+                "frame to top up a chunk or two.",
+                parse_mode="Markdown",
+            )
+            return
+
+        fname = doc.file_name or f"video_{msg.message_id}.mp4"
+        ext   = Path(fname).suffix.lower()
+        if ext in VIDEO_EXTENSIONS:
+            kind = "video"
+        elif ext in IMAGE_EXTENSIONS:
+            kind = "image"
+        else:
+            await msg.reply_text(
+                f"Unexpected file type: `{escape_backticks(fname)}`\n"
+                f"Expected a video ({', '.join(VIDEO_EXTENSIONS)}) or an image "
+                f"({', '.join(IMAGE_EXTENSIONS)}) of a QR frame.",
+                parse_mode="Markdown",
+            )
+            return
+        tg_obj = doc
 
     # Post an initial status message we'll edit throughout
     status_msg = await msg.reply_text(f"⬇️ Downloading `{escape_backticks(fname)}`…", parse_mode="Markdown")
     status     = StatusMessage(status_msg)
     # message_id keeps two queued uploads that happen to share a filename
     # from colliding on disk before the worker gets to either of them.
-    video_path = TEMP_DIR / f"{msg.message_id}_{fname}"
+    media_path = TEMP_DIR / f"{msg.message_id}_{fname}"
 
     try:
         await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
-        tg_file = await doc.get_file()
-        await tg_file.download_to_drive(str(video_path))
-        size_mb = video_path.stat().st_size / 1_048_576
+        tg_file = await tg_obj.get_file()
+        await tg_file.download_to_drive(str(media_path))
+        size_mb = media_path.stat().st_size / 1_048_576
     except Exception as e:
         logger.exception("Download failed")
         await status.update(f"❌ Download failed: {e}")
         return
 
     # Queue for processing — video_worker() handles jobs one at a time, in
-    # order, so several uploads (a transfer split across videos, or just
-    # sent in a burst) merge into the same transfer instead of the later
-    # ones being rejected while an earlier one is still scanning.
+    # order, so several uploads (a transfer split across videos/photos, or
+    # just sent in a burst) merge into the same transfer instead of the
+    # later ones being rejected while an earlier one is still scanning.
+    scan_label = "Scanning photo…" if kind == "image" else "Scanning video frames…"
     ahead = pending_videos.qsize() + (1 if is_busy else 0)
     if ahead == 0:
-        await status.update(f"✅ Downloaded `{escape_backticks(fname)}` ({size_mb:.1f} MB)\n\n🎬 *Step 1/4* — Scanning video frames…")
+        await status.update(f"✅ Downloaded `{escape_backticks(fname)}` ({size_mb:.1f} MB)\n\n🎬 *Step 1/4* — {scan_label}")
     else:
         plural = "s" if ahead != 1 else ""
         await status.update(
             f"✅ Downloaded `{escape_backticks(fname)}` ({size_mb:.1f} MB)\n"
-            f"⏳ Queued behind {ahead} video{plural} — I'll start automatically once free."
+            f"⏳ Queued behind {ahead} upload{plural} — I'll start automatically once free."
         )
 
-    await pending_videos.put(VideoJob(video_path=video_path, fname=fname, status=status, chat_id=msg.chat_id))
+    await pending_videos.put(VideoJob(video_path=media_path, fname=fname, status=status, chat_id=msg.chat_id, kind=kind))
 
 
 async def video_worker(bot):
@@ -636,7 +741,7 @@ async def video_worker(bot):
         job = await pending_videos.get()
         is_busy = True
         try:
-            zip_path, file_count = await process_video(job.video_path, job.status)
+            zip_path, file_count = await process_video(job.video_path, job.status, kind=job.kind)
 
             await job.status.update(f"📤 Sending zip ({file_count} file(s))…")
             await bot.send_chat_action(chat_id=job.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
@@ -690,7 +795,9 @@ async def video_worker(bot):
                 f"Missing: {ranges_display}\n\n"
                 f"On the sender PC, run:\n"
                 f"`python sender.py --resend {missing_str}`{resend_note}\n"
-                f"and send me that (shorter) video — no need to redo the whole thing.\n\n"
+                f"and send me that (shorter) video — or, for just a chunk or two, "
+                f"a single *photo* of the QR frame works too. No need to redo the "
+                f"whole thing.\n\n"
                 f"Or send /reset to abandon this transfer and start over."
             )
 
@@ -718,8 +825,8 @@ def main():
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("reset", cmd_reset))
-    # Catch both document and video message types
-    app.add_handler(MessageHandler(filters.Document.ALL | filters.VIDEO, handle_video))
+    # Catch document, video, and photo message types
+    app.add_handler(MessageHandler(filters.Document.ALL | filters.VIDEO | filters.PHOTO, handle_media))
 
     logger.info("Converter bot running…")
     app.run_polling(drop_pending_updates=True)

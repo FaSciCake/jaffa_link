@@ -382,8 +382,32 @@ if __name__ == '__main__':
     print(f"Split into {len(data_chunks)} QR chunk(s). Checksum: {digest[:12]}…")
 
     if args.resend:
-        wanted = {int(x) for x in args.resend.split(',')}
+        wanted     = {int(x) for x in args.resend.split(',')}
+        total_now  = len(data_chunks)  # indices 1..total_now, before filtering
+        out_of_range = sorted(i for i in wanted if i < 1 or i > total_now)
         data_chunks = [c for c in data_chunks if int(c.split('/', 1)[0]) in wanted]
+
+        # build_chunks() re-derives everything from scratch on every run --
+        # total chunk count and each index's byte range both depend on
+        # --chunk-size and the exact folder contents. If either drifted
+        # since the run that produced the bot's "missing: N" numbers, a
+        # requested index may not exist in *this* run's chunking at all.
+        # That used to fail silently: data_chunks would end up empty (or
+        # missing some requested indices) and the slideshow would just
+        # show the HASH frame forever with nothing to decode -- which the
+        # bot then reports as the confusing "No QR chunks found in the
+        # video", with no hint that the mismatch was on this end.
+        if out_of_range or not data_chunks:
+            print(f"\n⚠️  --resend asked for chunk(s) {sorted(wanted)}, but this run only "
+                  f"produced {total_now} chunk(s) total"
+                  + (f" (out of range: {out_of_range})." if out_of_range else "."))
+            print("This almost always means --chunk-size or the source folder's contents")
+            print("don't match the run that produced those chunk numbers -- the bot's")
+            print("missing-chunk list only makes sense against that exact same chunking.")
+            print("Re-run with the same --chunk-size (and unchanged folder) as the original")
+            print("send, or drop --resend to resend the whole transfer.")
+            sys.exit(1)
+
         print(f"--resend given: only looping {len(data_chunks)} chunk(s): {sorted(wanted)}")
         print("(Make sure the folder contents haven't changed since the first attempt —")
         print(" the checksum above needs to match what the bot already has.)")
