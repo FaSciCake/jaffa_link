@@ -294,6 +294,33 @@ async def main():
     cb.reset_progress()
     print("Total-mismatch reset -> correctly surfaced to the user via reset_note")
 
+    # ---- 11. Regression: a chunk payload starting or ending with a literal
+    #          space must round-trip exactly. Space is one of base45's 45
+    #          alphabet characters -- legitimate payload content, not
+    #          incidental whitespace -- so a chunk boundary can genuinely
+    #          land on one. scan_video_sync/scan_image_sync used to
+    #          .strip() the raw decoded QR text, silently eating that
+    #          character whenever it did. That's deterministic (a property
+    #          of the chunk's content and chunk-size boundary, not of
+    #          capture quality), which is exactly what made one specific
+    #          chunk fail its own checksum every single time, regardless
+    #          of re-recording, chunk-size, or framerate. -----------------
+    space_img_dir = Path(tempfile.mkdtemp(prefix="qrtest_space_"))
+    space_payload = " " + "A" * 30 + " "  # leading AND trailing space
+    space_cs = hashlib.sha256(space_payload.encode('ascii')).hexdigest()[:8]
+    space_frame = f"7/50/{space_cs}:{space_payload}"
+
+    space_img_path = space_img_dir / "frame.png"
+    cv2.imwrite(str(space_img_path), render_qr_frame_image([space_frame]))
+
+    space_chunks, space_total, _ = cb.scan_image_sync(space_img_path)
+    assert space_chunks.get(7) == space_payload, (
+        f"a leading/trailing space in the payload must survive the decode "
+        f"round trip: got {space_chunks.get(7)!r}, expected {space_payload!r}"
+    )
+    print("Leading/trailing-space payload test -> round-tripped exactly, no corruption")
+    shutil.rmtree(space_img_dir)
+
     shutil.rmtree(src)
     shutil.rmtree(extract_dir)
     shutil.rmtree(img_dir)

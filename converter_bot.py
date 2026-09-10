@@ -446,7 +446,17 @@ def scan_video_sync(video_path: Path, status: StatusMessage, loop: asyncio.Abstr
             for r in results:
                 if not r.valid:
                     continue
-                text = r.text.strip()
+                # NOT .strip()'d: base45's alphabet legitimately includes a
+                # space character as real payload data (it's one of the 45
+                # symbols), so a chunk boundary can genuinely start or end
+                # on one. Stripping "whitespace" here was silently eating
+                # that character whenever it landed at a chunk's edge --
+                # deterministically, every single re-record, since it's a
+                # property of the chunk's content and chunk-size boundary,
+                # not of how well the frame was captured. The regex below
+                # is fully anchored (^...$), so any real decoder artifact
+                # still fails to match rather than being silently kept.
+                text = r.text
                 current_texts.add(text)
                 if text in last_texts:
                     continue
@@ -561,7 +571,7 @@ def scan_image_sync(image_path: Path, baseline: set[int] = frozenset()):
     for r in zxingcpp.read_barcodes(frame):
         if not r.valid:
             continue
-        text = r.text.strip()
+        text = r.text  # see the comment on the same line in scan_video_sync -- not .strip()'d on purpose
 
         hm = HASH_RE.match(text)
         if hm:

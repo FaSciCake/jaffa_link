@@ -66,6 +66,17 @@ which decodes it back into files and returns a zip.
   read as "combining broke" rather than what it actually was: a mismatch
   on the sender side, most commonly `sender.py --resend` run against
   drifted folder contents — see `sender_state.json` above).
+  `scan_video_sync()` (and `scan_image_sync()`) take the raw decoded
+  barcode text as-is — deliberately **not** `.strip()`'d. Base45's
+  alphabet includes a space character as one of its 45 valid symbols, so
+  it's legitimate payload data, not incidental whitespace; a chunk
+  boundary can genuinely land on one. `.strip()` used to silently eat
+  that character whenever it did — deterministically, since it's a
+  property of the chunk's content and `--chunk-size` boundary, not of
+  capture quality, which is exactly what made one specific chunk fail
+  its own per-chunk checksum forever, regardless of re-recording,
+  chunk-size, or framerate. The regexes are fully anchored (`^...$`), so
+  a genuine decoder artifact still fails to match rather than being kept.
   `scan_video_sync()` downscales frames wider/taller than `MAX_SCAN_DIM`
   (1600px) before handing them to zxing-cpp — barcode-detection cost scales
   with pixel count, and a QR code doesn't need 1080p/4K to decode reliably.
