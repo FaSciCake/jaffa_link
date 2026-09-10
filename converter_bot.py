@@ -75,6 +75,23 @@ HASH_RE  = re.compile(r'^HASH:([0-9a-f]{64})$')
 VIDEO_EXTENSIONS = (".mov", ".mp4", ".avi", ".mkv")
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 
+
+def _chunk_checksum_ok(idx: int, chunk_cs: str, payload: str, source: str) -> bool:
+    """Shared per-chunk checksum check for scan_video_sync/scan_image_sync.
+    Logs a diagnostic on mismatch -- payload length + head/tail -- since a
+    discarded chunk otherwise leaves no trace of *why* it was rejected,
+    which matters for telling a genuine misread apart from an encode/decode
+    bug (stray whitespace, a case/charset mismatch, truncation, etc.)."""
+    expected = hashlib.sha256(payload.encode('ascii')).hexdigest()[:8]
+    if expected == chunk_cs:
+        return True
+    logger.warning(
+        "Chunk %d checksum mismatch (%s): QR carried checksum=%s, payload "
+        "(len=%d) actually hashes to %s. payload head=%r tail=%r",
+        idx, source, chunk_cs, len(payload), expected, payload[:24], payload[-24:],
+    )
+    return False
+
 # Minimum real time between progress-bar edits. Scanning a pre-recorded
 # video isn't real-time-bound (cv2 decodes frames as fast as the CPU
 # allows), so gating purely on chunk count (the old "every 5 chunks" rule)
@@ -457,7 +474,7 @@ def scan_video_sync(video_path: Path, status: StatusMessage, loop: asyncio.Abstr
                 # simply not stored, so a cleaner read of the same index --
                 # later in this same looping video, or in a follow-up video
                 # -- can still fill it in normally.
-                if hashlib.sha256(payload.encode('ascii')).hexdigest()[:8] != chunk_cs:
+                if not _chunk_checksum_ok(idx, chunk_cs, payload, "video"):
                     rejected += 1
                     continue
 
@@ -558,7 +575,7 @@ def scan_image_sync(image_path: Path, baseline: set[int] = frozenset()):
         idx, total, chunk_cs, payload = (
             int(m.group(1)), int(m.group(2)), m.group(3), m.group(4)
         )
-        if hashlib.sha256(payload.encode('ascii')).hexdigest()[:8] != chunk_cs:
+        if not _chunk_checksum_ok(idx, chunk_cs, payload, "photo"):
             rejected += 1
             continue
 
